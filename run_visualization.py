@@ -1,259 +1,219 @@
-import os
-import torch
-import h5py
-import numpy as np
-import cv2
-import matplotlib
-matplotlib.use('Agg') # Use Agg backend for non-interactive plotting
-import matplotlib.pyplot as plt
-from models import DSRRL
-from visualization.grad_cam import SmoothGradCAMpp
+"""Generate temporal and spatial ISCRL explanations for one video."""
+
+from __future__ import annotations
+
 import argparse
+import json
+from pathlib import Path
+from typing import Dict, Iterable, Tuple
 
-# Configuration
-FRAMES_ROOT = r"D:\papers\videos_15\summe_frames"
+import cv2
+import h5py
+import matplotlib
 
-def load_model(checkpoint_path, input_dim=1024, hidden_dim=512, num_layers=2, rnn_cell='gru'):
-    """Load the trained DSRRL model."""
-    print(f"Loading model from {checkpoint_path}...")
-    
-    # Initialize model
-    model = DSRRL(in_dim=input_dim, hid_dim=hidden_dim, num_layers=num_layers, cell=rnn_cell)
-    
-    # Load weights
-    if torch.cuda.is_available():
-        checkpoint = torch.load(checkpoint_path)
-    else:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
 
-    # Handle DataParallel wrapper and state_dict extraction
-    if isinstance(checkpoint, dict):
-        if 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        else:
-            state_dict = checkpoint
-    else:
-        print("Error: Unknown checkpoint format.")
-        return None
+from models import ISCRLPolicy
+from visualization.grad_cam import SmoothedPolicyGradCAMPP
 
-    # Remove 'module.' prefix if present (from DataParallel)
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith('module.'):
-            new_state_dict[k[7:]] = v
-        else:
-            new_state_dict[k] = v
 
-    model.load_state_dict(new_state_dict)
-    
-    if torch.cuda.is_available():
-        model = model.cuda()
-    
-    model.eval()
-    return model
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp"}
 
-def get_video_data(h5_path, key):
-    with h5py.File(h5_path, 'r') as f:
-        features = f[key]['features'][...]
-        # Try to get video name
-        try:
-            video_name = f[key]['video_name'][()].decode('utf-8')
-        except:
-            video_name = None
-            print("Warning: Could not find 'video_name' in dataset.")
-            
-    return features, video_name
 
-def visualize_temporal(att_weights, output_path):
-    """Plot temporal attention weights."""
-    att_weights = att_weights.squeeze().cpu().numpy()
-    
-    # If 2D (matrix), take the mean attention received by each frame (column mean)
-    # This represents "how much other frames attended to this frame"
-    if len(att_weights.shape) == 2:
-        att_weights = np.mean(att_weights, axis=0)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="ISCRL explanation pipeline")
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--key", required=True)
+    parser.add_argument("--frame-dir", required=True, help="directory containing raw frames")
+    parser.add_argument("--output", default="visualization_results")
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument(
+        "--explain-all",
+        action="store_true",
+        help="run spatial explanations for every sampled frame (slow)",
+    )
+    parser.add_argument("--smooth-samples", type=int, default=10)
+    parser.add_argument("--smooth-noise", type=float, default=0.15)
+    parser.add_argument("--omega", type=float, default=0.5)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    return parser
 
+
+def _strip_parallel_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {key.removeprefix("module."): value for key, value in state_dict.items()}
+
+
+def load_model(checkpoint_path: str, device: torch.device) -> ISCRLPolicy:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    saved_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
+    model = ISCRLPolicy(
+        input_dim=int(saved_args.get("input_dim", 1024)),
+        state_dim=int(saved_args.get("hidden_dim", 512)),
+        invariant_dim=int(saved_args.get("invariant_dim", 128)),
+        projector_hidden_dim=int(saved_args.get("projector_hidden_dim", 512)),
+        attention_dropout=float(saved_args.get("attention_dropout", 0.5)),
+    )
+    model.load_state_dict(_strip_parallel_prefix(state_dict))
+    return model.to(device).eval()
+
+
+def max_normalize(values: np.ndarray) -> np.ndarray:
+    output = np.asarray(values, dtype=np.float64).copy()
+    valid = np.isfinite(output)
+    if not valid.any():
+        return output
+    maximum = np.max(output[valid])
+    output[valid] = output[valid] / maximum if maximum > 0 else 0.0
+    return output
+
+
+def resolve_frame(
+    frame_dir: Path,
+    feature_index: int,
+    original_index: int,
+    sequence_length: int,
+) -> Path:
+    candidates = (
+        f"frame_{original_index:04d}.jpg",
+        f"frame_{original_index:06d}.jpg",
+        f"img_{original_index + 1:05d}.jpg",
+        f"img_{original_index:05d}.jpg",
+    )
+    for filename in candidates:
+        candidate = frame_dir / filename
+        if candidate.exists():
+            return candidate
+    images = sorted(path for path in frame_dir.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES)
+    if len(images) == sequence_length:
+        return images[feature_index]
+    if 0 <= original_index < len(images):
+        return images[original_index]
+    raise FileNotFoundError(
+        f"could not map sampled frame {feature_index} (original index {original_index}) "
+        f"inside {frame_dir}"
+    )
+
+
+def save_temporal_plots(
+    probabilities: np.ndarray,
+    temporal_scores: np.ndarray,
+    attention: np.ndarray,
+    output_dir: Path,
+) -> None:
     plt.figure(figsize=(12, 4))
-    plt.plot(att_weights, label='Avg Self-Attention Received', color='blue')
-    plt.fill_between(range(len(att_weights)), att_weights, color='blue', alpha=0.1)
-    
-    plt.xlabel('Frame Index')
-    plt.ylabel('Attention Weight')
-    plt.title('Temporal Explainability: Attention over Time (DSRRL)')
+    plt.plot(probabilities, color="green", label="Frame-selection probability")
+    plt.plot(temporal_scores, color="blue", label="Temporal explanation score")
+    plt.xlabel("Sampled frame index")
+    plt.ylabel("Normalized score")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(output_path)
+    plt.savefig(output_dir / "temporal_scores.png", dpi=180)
     plt.close()
-    print(f"Saved temporal visualization to {output_path}")
-    return att_weights
 
-def visualize_spatial(video_name, video_key, important_indices, output_dir, top_k=5):
-    """Generate Smooth Grad-CAM++ for top-k important frames."""
-    print(f"Generating spatial visualizations for video: {video_name} (Key: {video_key})")
-    
-    grad_cam = SmoothGradCAMpp()
-    
-    # Try finding directory by name first, then by key
-    video_dir = os.path.join(FRAMES_ROOT, video_name)
-    if not os.path.exists(video_dir):
-        # Try key
-        video_dir_key = os.path.join(FRAMES_ROOT, video_key)
-        if os.path.exists(video_dir_key):
-            video_dir = video_dir_key
-        else:
-            print(f"Error: Frame directory not found via name '{video_name}' or key '{video_key}' in {FRAMES_ROOT}")
-            return
-
-    # Sort indices by importance (descending) but keep only top K
-    # important_indices are already top-k, but let's iterate them
-    
-    for rank, idx in enumerate(important_indices):
-        # Construct image filename
-        # Based on file listing: frame_0000.jpg, frame_0015.jpg... (Step 15, 0-based)
-        # Mapping: Feature Index i -> frame_{i*15:04d}.jpg
-        frame_number = idx * 15
-        img_name = f"frame_{frame_number:04d}.jpg"
-        img_path = os.path.join(video_dir, img_name)
-        
-        if not os.path.exists(img_path):
-             # Try fallback: maybe direct index?
-            img_name_alt = f"img_{idx+1:05d}.jpg" 
-            img_path_alt = os.path.join(video_dir, img_name_alt)
-            if os.path.exists(img_path_alt):
-                img_path = img_path_alt
-            else:
-                 # Try 0-based img_
-                img_name_alt2 = f"img_{idx:05d}.jpg"
-                if os.path.exists(os.path.join(video_dir, img_name_alt2)):
-                     img_path = os.path.join(video_dir, img_name_alt2)
-                else: 
-                    print(f"Skipping feature idx {idx} (expected {img_name}), file not found.")
-                    continue
-
-        heatmap_img, _ = grad_cam.forward(img_path)
-        
-        if heatmap_img is not None:
-            save_path = os.path.join(output_dir, f"spatial_top{rank+1}_frame{idx}.jpg")
-            cv2.imwrite(save_path, heatmap_img)
-            print(f"Saved spatial visualization to {save_path}")
-
-def run_pipeline(checkpoint, dataset_path, video_key, output_root='visualization_results'):
-    # 1. Load Model
-    model = load_model(checkpoint)
-    if model is None: return
-
-    # 2. Get Data
-    features, video_name = get_video_data(dataset_path, video_key)
-    print(f"Processing Video Key: {video_key}, Name: {video_name}")
-    
-    if video_name is None:
-        print("Cannot proceed with spatial visualization without video name.")
-        return
-
-    # Create output directory
-    video_output_dir = os.path.join(output_root, video_name)
-    os.makedirs(video_output_dir, exist_ok=True)
-
-    # 3. Temporal Forward Pass
-    seq = torch.from_numpy(features).unsqueeze(0) # (1, Seq, Dim)
-    if torch.cuda.is_available():
-        seq = seq.cuda()
-        
-    with torch.no_grad():
-        # returns: p, out_lay, att_score, features_inv, att_weights_
-        _, _, _, _, att_weights = model(seq)
-
-    # 4. Visualize Temporal
-    temporal_plot_path = os.path.join(video_output_dir, 'temporal_attention.png')
-    att_weights_np = visualize_temporal(att_weights, temporal_plot_path)
-
-    # 5. Select Top-K Frames
-    top_k = 5
-    # Get indices of top_k attention scores
-    # att_weights_np shape is (SeqLen, 1) or (SeqLen,)
-    # If using Multi-Head, might be (1, Heads, SeqLen, SeqLen).
-    # models.py SelfAttention:
-    # logits = torch.matmul(Q, K.transpose(1,0)) -> (N, N)
-    # att_weights_ = softmax(logits) -> (N, N)
-    # Then y = V * weights
-    # WAIT. models.py:48: att_weights_ = nn.functional.softmax(logits, dim=-1)
-    # It returns an (N, N) matrix! The full attention map!
-    # Not just a per-frame score.
-    
-    # "Temporal Attention" usually means "Importance of each frame". 
-    # But Self-Attention is pairwise.
-    # How does DSRRL use this?
-    # models.py:84: out_lay = att_score + h
-    # models.py:85: p = torch.sigmoid(self.fc(out_lay))
-    # `p` is the frame importance score!
-    # `att_weights` is the internal mechanism.
-    # If the user asks for "Displaying Temporal Attention Weights" (Self-Attention 权重), 
-    # they might want the Attention Matrix (Heatmap N x N) OR the final importance scores (`p`).
-    
-    # Interpretation:
-    # 1. `p` (output probability) = Final Keyframe Selection Score.
-    # 2. `att_weights_` (N x N) = How frames relate to each other.
-    
-    # The user request says: "利用 Self-Attention 权重展示时序关注点"
-    # Usually this means showing the Attention Matrix or the diagonal?
-    # Or maybe the "attention distribution" for a specific query?
-    # But here it's Self-Attention.
-    
-    # Let's visualize:
-    # A. The Final Importance Score Curve `p` (This is the most "temporal attention" like thing for summarization).
-    # B. The Self-Attention Matrix (as a heatmap) to show relationships.
-    
-    # Let's save both.
-    
-    # For Spatial selection, we should use the FRAMES with highest `p` (Probability of being a summary).
-    # Because `p` is what the model "chose".
-    
-    # Redo step 3: Get `p` as well.
-    with torch.no_grad():
-        probs, _, _, _, att_matrix = model(seq)
-        
-    probs = probs.squeeze().cpu().numpy()
-    att_matrix = att_matrix.squeeze().cpu().numpy() # (N, N)
-    
-    # 4. Unload Model to save GPU memory for Grad-CAM
-    del model
-    del seq
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    print("Unloaded DSRRL model and cleared CUDA cache.")
-
-    # 5. Visualize Temporal
-    plt.figure(figsize=(12, 4))
-    plt.plot(probs, label='Importance Score (P)', color='green')
-    plt.xlabel('Frame Index')
-    plt.ylabel('Probability')
-    plt.title('Frame Importance Scores (Model Output)')
-    plt.legend()
+    plt.figure(figsize=(8, 7))
+    plt.imshow(attention, cmap="hot", interpolation="nearest", aspect="auto")
+    plt.xlabel("Key frame")
+    plt.ylabel("Query frame")
+    plt.colorbar(label="Attention")
     plt.tight_layout()
-    plt.savefig(os.path.join(video_output_dir, 'importance_scores.png'))
+    plt.savefig(output_dir / "temporal_attention_matrix.png", dpi=180)
     plt.close()
 
-    # Visualize Attention Matrix
-    plt.figure(figsize=(10, 10))
-    plt.imshow(att_matrix, cmap='hot', interpolation='nearest')
-    plt.title('Self-Attention Matrix')
-    plt.xlabel('Key Frame')
-    plt.ylabel('Query Frame')
-    plt.colorbar()
-    plt.savefig(os.path.join(video_output_dir, 'attention_matrix.png'))
-    plt.close()
-    
-    print(f"Saved temporal visualizations to {video_output_dir}")
 
-    # 6. Spatial on Top-K Importance Frames
-    top_indices = np.argsort(probs)[::-1][:top_k]
-    visualize_spatial(video_name, video_key, top_indices, video_output_dir, top_k=top_k)
+def run(args: argparse.Namespace) -> None:
+    if not 0 <= args.omega <= 1:
+        raise ValueError("--omega must be in [0,1]")
+    if args.top_k < 1:
+        raise ValueError("--top-k must be at least 1")
+    device = torch.device(args.device)
+    model = load_model(args.checkpoint, device)
+    with h5py.File(args.dataset, "r") as dataset:
+        group = dataset[args.key]
+        features = np.asarray(group["features"], dtype=np.float32)
+        picks = (
+            np.asarray(group["picks"], dtype=np.int64)
+            if "picks" in group
+            else np.arange(len(features), dtype=np.int64)
+        )
+    sequence = torch.from_numpy(features).unsqueeze(0).to(device)
+    with torch.no_grad():
+        probabilities, _, attention, _, _ = model(sequence)
+    probabilities_np = probabilities[0, :, 0].cpu().numpy()
+    attention_np = attention[0].cpu().numpy()
+    # Eq. (13): mean attention received by each frame (column mean).
+    temporal_raw = attention_np.mean(axis=0)
+    temporal_normalized = max_normalize(temporal_raw)
+
+    output_dir = Path(args.output) / args.key.replace("/", "_")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_temporal_plots(
+        probabilities_np,
+        temporal_normalized,
+        attention_np,
+        output_dir,
+    )
+
+    if args.explain_all:
+        indices = np.arange(len(features))
+    else:
+        indices = np.argsort(probabilities_np)[::-1][: min(args.top_k, len(features))]
+    explainer = SmoothedPolicyGradCAMPP(
+        model,
+        samples=args.smooth_samples,
+        noise_std=args.smooth_noise,
+        device=device,
+    )
+    frame_dir = Path(args.frame_dir)
+    spatial_raw = np.full(len(features), np.nan, dtype=np.float64)
+    frame_paths: Dict[int, str] = {}
+    for rank, feature_index in enumerate(indices, start=1):
+        original_index = int(picks[min(feature_index, len(picks) - 1)])
+        image_path = resolve_frame(
+            frame_dir,
+            int(feature_index),
+            original_index,
+            len(features),
+        )
+        overlay, heatmap, spatial_score = explainer.explain(
+            image_path,
+            sequence,
+            int(feature_index),
+        )
+        spatial_raw[feature_index] = spatial_score
+        frame_paths[int(feature_index)] = str(image_path)
+        cv2.imwrite(str(output_dir / f"spatial_rank{rank:03d}_frame{feature_index:05d}.jpg"), overlay)
+        cv2.imwrite(
+            str(output_dir / f"heatmap_rank{rank:03d}_frame{feature_index:05d}.png"),
+            np.uint8(255.0 * heatmap),
+        )
+
+    # Eqs. (14)-(15): separate max normalization, followed by weighted fusion.
+    spatial_normalized = max_normalize(spatial_raw)
+    combined = args.omega * temporal_normalized + (1.0 - args.omega) * spatial_normalized
+    np.savez_compressed(
+        output_dir / "explanation_scores.npz",
+        probabilities=probabilities_np,
+        temporal_attention=attention_np,
+        temporal_raw=temporal_raw,
+        temporal_normalized=temporal_normalized,
+        spatial_raw=spatial_raw,
+        spatial_normalized=spatial_normalized,
+        combined=combined,
+        omega=np.asarray(args.omega),
+    )
+    with (output_dir / "explained_frames.json").open("w", encoding="utf-8") as file:
+        json.dump(frame_paths, file, indent=2)
+    print(f"Saved explanations to {output_dir}")
+
+
+def main() -> None:
+    run(build_parser().parse_args())
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--checkpoint', type=str, required=True, help='Path to .pth.tar model')
-    parser.add_argument('--dataset', type=str, default='datasets/eccv16_dataset_summe_google_pool5.h5')
-    parser.add_argument('--key', type=str, default='video_1')
-    args = parser.parse_args()
-    
-    run_pipeline(args.checkpoint, args.dataset, args.key)
+    main()

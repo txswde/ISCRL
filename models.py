@@ -1,106 +1,143 @@
+"""Dual-branch projection-fusion policy network for ISCRL."""
+
+from __future__ import annotations
+
+from typing import Dict, Tuple
+
 import torch
-import torch.nn as nn
-from torch.nn import functional as F
-from torch.autograd import Variable
+from torch import Tensor, nn
+import torch.nn.functional as F
 
-__all__ = ['DSRRL']
+from iscrl_components import SimCLRProjector
 
-class SelfAttention(nn.Module):
-
-    def __init__(self, apperture=-1, ignore_itself=False, input_size=1024, output_size=1024):
-        super(SelfAttention, self).__init__()
-
-        self.apperture = apperture
-        self.ignore_itself = ignore_itself
-
-        self.m = input_size
-        self.output_size = output_size
-
-        self.K = nn.Linear(in_features=self.m, out_features=self.output_size, bias=False)
-        self.Q = nn.Linear(in_features=self.m, out_features=self.output_size, bias=False)
-        self.V = nn.Linear(in_features=self.m, out_features=self.output_size, bias=False)
-        self.output_linear = nn.Linear(in_features=self.output_size, out_features=self.m, bias=False)
-
-        self.drop50 = nn.Dropout(0.5)
+__all__ = ["ISCRLPolicy", "DSRRL", "SingleHeadSelfAttention"]
 
 
+class SingleHeadSelfAttention(nn.Module):
+    """Single-head scaled dot-product attention over sampled frames."""
 
-    def forward(self, x):
-        n = x.shape[0]  # sequence length
+    def __init__(self, feature_dim: int, dropout: float = 0.5) -> None:
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.query = nn.Linear(feature_dim, feature_dim, bias=False)
+        self.key = nn.Linear(feature_dim, feature_dim, bias=False)
+        self.value = nn.Linear(feature_dim, feature_dim, bias=False)
+        self.output = nn.Linear(feature_dim, feature_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
-        K = self.K(x)  # ENC (n x m) => (n x H) H= hidden size
-        Q = self.Q(x)  # ENC (n x m) => (n x H) H= hidden size
-        V = self.V(x)
+    def forward(self, features: Tensor) -> Tuple[Tensor, Tensor]:
+        # features: (B, T, D)
+        q = self.query(features)
+        k = self.key(features)
+        v = self.value(features)
+        logits = torch.matmul(q, k.transpose(-1, -2)) / self.feature_dim**0.5
+        attention = F.softmax(logits, dim=-1)
+        context = torch.matmul(self.dropout(attention), v)
+        return self.output(context), attention
 
-        Q *= 0.06
-        logits = torch.matmul(Q, K.transpose(1,0))
 
-        if self.ignore_itself:
-            # Zero the diagonal activations (a distance of each frame with itself)
-            logits[torch.eye(n).byte()] = -float("Inf")
+class TemporalBranch(nn.Module):
+    """Branch-specific projection, bidirectional GRU, attention, and residual."""
 
-        if self.apperture > 0:
-            # Set attention to zero to frames further than +/- apperture from the current one
-            onesmask = torch.ones(n, n)
-            trimask = torch.tril(onesmask, -self.apperture) + torch.triu(onesmask, self.apperture)
-            logits[trimask == 1] = -float("Inf")
+    def __init__(self, input_dim: int, state_dim: int, dropout: float = 0.5) -> None:
+        super().__init__()
+        if state_dim % 2:
+            raise ValueError("state_dim must be even for a bidirectional GRU")
+        self.projection = nn.Linear(input_dim, state_dim)
+        self.rnn = nn.GRU(
+            input_size=state_dim,
+            hidden_size=state_dim // 2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.attention = SingleHeadSelfAttention(state_dim, dropout=dropout)
+        self.norm = nn.LayerNorm(state_dim)
 
-        att_weights_ = nn.functional.softmax(logits, dim=-1)
-        weights = self.drop50(att_weights_)
-        y = torch.matmul(V.transpose(1,0), weights).transpose(1,0)
-        y = self.output_linear(y)
+    def forward(self, features: Tensor) -> Tuple[Tensor, Tensor]:
+        projected = F.relu(self.projection(features), inplace=False)
+        recurrent, _ = self.rnn(projected)
+        attended, weights = self.attention(recurrent)
+        return self.norm(projected + recurrent + attended), weights
 
-        return y, att_weights_
 
-class DSRRL(nn.Module):
-    def __init__(self, in_dim=1024, hid_dim=512, num_layers=1, cell='lstm'):
-        super(DSRRL, self).__init__()
-        
-        if cell == 'lstm':
-            self.rnn = nn.LSTM(in_dim, hid_dim, num_layers=num_layers, bidirectional=True)
-        else:
-            self.rnn = nn.GRU(in_dim, hid_dim, num_layers=num_layers, bidirectional=True)
+class ISCRLPolicy(nn.Module):
+    """ISCRL policy with original and invariant semantic branches.
 
-        self.fc = nn.Linear(hid_dim*2, 1)
+    The branches are encoded independently and fused by a learnable linear
+    layer. The returned attention matrix is the equal-weight mean of the two
+    single-head branch matrices and is used only for temporal explanation.
+    """
 
-        self.att = SelfAttention(input_size=in_dim, output_size=in_dim)
-        
-        # [ISCRL] SimCLR Projector Head
-        # Projects 1024-dim features to 128-dim invariant space
-        self.simclr_projector = nn.Sequential(
-            nn.Linear(in_dim, 512),
-            nn.ReLU(),
-            nn.Linear(512, 128)
+    def __init__(
+        self,
+        input_dim: int = 1024,
+        state_dim: int = 512,
+        invariant_dim: int = 128,
+        projector_hidden_dim: int = 512,
+        attention_dropout: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.input_dim = input_dim
+        self.state_dim = state_dim
+        self.invariant_dim = invariant_dim
+        self.simclr_projector = SimCLRProjector(
+            input_dim=input_dim,
+            hidden_dim=projector_hidden_dim,
+            output_dim=invariant_dim,
+        )
+        self.original_branch = TemporalBranch(
+            input_dim=input_dim, state_dim=state_dim, dropout=attention_dropout
+        )
+        self.invariant_branch = TemporalBranch(
+            input_dim=invariant_dim, state_dim=state_dim, dropout=attention_dropout
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(2 * state_dim, state_dim),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(state_dim),
+        )
+        self.policy_head = nn.Linear(state_dim, 1)
+
+    def invariant_features(self, original_features: Tensor, normalize: bool = True) -> Tensor:
+        invariant = self.simclr_projector(original_features)
+        return F.normalize(invariant, dim=-1) if normalize else invariant
+
+    def set_projector_trainable(self, trainable: bool) -> None:
+        for parameter in self.simclr_projector.parameters():
+            parameter.requires_grad_(trainable)
+
+    def forward(
+        self,
+        original_features: Tensor,
+        invariant_features: Tensor | None = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor]]:
+        if original_features.dim() == 2:
+            original_features = original_features.unsqueeze(0)
+        if original_features.dim() != 3:
+            raise ValueError("original_features must have shape (T, D) or (B, T, D)")
+        if invariant_features is None:
+            invariant_features = self.invariant_features(original_features)
+        elif invariant_features.dim() == 2:
+            invariant_features = invariant_features.unsqueeze(0)
+
+        original_state, original_attention = self.original_branch(original_features)
+        invariant_state, invariant_attention = self.invariant_branch(invariant_features)
+        fused_state = self.fusion(torch.cat((original_state, invariant_state), dim=-1))
+        probabilities = torch.sigmoid(self.policy_head(fused_state))
+        temporal_attention = 0.5 * (original_attention + invariant_attention)
+        branch_attention = {
+            "original": original_attention,
+            "invariant": invariant_attention,
+        }
+        return (
+            probabilities,
+            fused_state,
+            temporal_attention,
+            invariant_features,
+            branch_attention,
         )
 
-    def forward(self, x):
-        h, _ = self.rnn(x)
 
-        m = x.shape[2] # Feature size
-        x_reshaped = x.view(-1, m)
-
-        att_score, att_weights_ = self.att(x_reshaped)
-        
-        out_lay = att_score + h
-        p = torch.sigmoid(self.fc(out_lay))
-        
-        # [ISCRL] Compute Invariant Features
-        # Using x_reshaped which is (N*SeqLen, Dim)
-        features_inv = self.simclr_projector(x_reshaped)
-        
-        # Reshape back to (Batch, SeqLen, Dim) if needed, but for SimCLR loss we often use flat
-        # Let's keep it flat or match original shape. 
-        # Original code returns `out_lay` as (1, SeqLen, Dim) likely, let's check shapes.
-        # h is (Batch, SeqLen, Dim*2) because bidirectional?
-        # models.py:60: self.rnn = nn.LSTM(..., bidirectional=True)
-        # models.py:64: self.fc = nn.Linear(hid_dim*2, 1)
-        # So h is (Batch, SeqLen, Hidden*2).
-        
-        # x is (Batch, SeqLen, Dim).
-        # x.view(-1, m) flattens batch and seq.
-        
-        # features_inv will be (Batch*SeqLen, 128)
-        # Reshape to (Batch, SeqLen, 128) to match consistency
-        features_inv = features_inv.view(x.shape[0], x.shape[1], -1)
-
-        return p, out_lay, att_score, features_inv, att_weights_ 
+# Preserve the original public class name for existing checkpoints/scripts.
+DSRRL = ISCRLPolicy

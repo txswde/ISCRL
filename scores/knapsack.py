@@ -1,24 +1,13 @@
-import numpy as np
-from ortools.algorithms import pywrapknapsack_solver
+"""Compatibility wrapper around the repository's dynamic-programming solver."""
+
+from knapsack import knapsack_dp
 
 
 def knapsack_ortools(values, weights, items, capacity):
-    """0-1 Knapsack problem solver"""
-    osolver = pywrapknapsack_solver.KnapsackSolver(
-        pywrapknapsack_solver.KnapsackSolver.KNAPSACK_DYNAMIC_PROGRAMMING_SOLVER,
-        "SummarizationSegmentSelection")
-
-    scale = 1000
-    values = np.array(values)
-    weights = np.array(weights)
-    values = (values * scale).astype(np.int)
-    weights = (weights).astype(np.int)
-    capacity = capacity
-
-    osolver.Init(values.tolist(), [weights.tolist()], [capacity])
-    osolver.Solve()
-    packed_items = [x for x in range(0, len(weights))
-                    if osolver.BestSolutionContains(x)]
-
-    return packed_items
-
+    """Keep the historical API without requiring a version-specific OR-Tools."""
+    return knapsack_dp(
+        [float(value) for value in values],
+        [int(weight) for weight in weights],
+        int(items),
+        int(capacity),
+    )

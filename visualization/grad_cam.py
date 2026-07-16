@@ -1,114 +1,168 @@
-import torch
-import torch.nn.functional as F
+"""Policy-conditioned smoothed Grad-CAM++ for ISCRL explanations."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Tuple
+
 import cv2
 import numpy as np
-import torchvision.models as models
-from torchvision import transforms
+import torch
+from torch import Tensor, nn
+import torch.nn.functional as F
+from torchvision.models import GoogLeNet_Weights, googlenet
 
-class SmoothGradCAMpp:
+from models import ISCRLPolicy
+
+
+class FrozenGoogLeNetPool5(nn.Module):
+    """Expose the last GoogLeNet convolutional maps and 1024-D pool5 feature."""
+
+    def __init__(self, weights: GoogLeNet_Weights = GoogLeNet_Weights.IMAGENET1K_V1) -> None:
+        super().__init__()
+        self.weights = weights
+        # TorchVision loads the published auxiliary-head weights as part of the
+        # ImageNet checkpoint; the heads are never called by this feature path.
+        self.network = googlenet(weights=weights)
+        self.network.eval()
+        for parameter in self.network.parameters():
+            parameter.requires_grad_(False)
+
+    @property
+    def preprocess(self):
+        return self.weights.transforms()
+
+    def forward(self, image: Tensor) -> Tuple[Tensor, Tensor]:
+        net = self.network
+        x = net.conv1(image)
+        x = net.maxpool1(x)
+        x = net.conv2(x)
+        x = net.conv3(x)
+        x = net.maxpool2(x)
+        x = net.inception3a(x)
+        x = net.inception3b(x)
+        x = net.maxpool3(x)
+        x = net.inception4a(x)
+        x = net.inception4b(x)
+        x = net.inception4c(x)
+        x = net.inception4d(x)
+        x = net.inception4e(x)
+        x = net.maxpool4(x)
+        x = net.inception5a(x)
+        activations = net.inception5b(x)
+        pool5 = net.avgpool(activations).flatten(1)
+        return activations, pool5
+
+
+class SmoothedPolicyGradCAMPP:
+    """Explain a policy probability using the same fixed GoogLeNet feature path.
+
+    The target is the ISCRL probability assigned to one sampled frame, not an
+    ImageNet class. For every noisy view, the frame's freshly computed pool5
+    feature replaces the corresponding pre-extracted feature in the video
+    context before the policy forward pass.
     """
-    Smooth Grad-CAM++ implementation for spatial explainability.
-    Uses a pre-trained ResNet50 as a visual proxy.
-    """
-    def __init__(self, model=None, target_layer=None, n_samples=10, stdev_spread=0.15):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        if model is None:
-            # Use ResNet50 as default proxy
-            self.model = models.resnet50(pretrained=True).to(self.device)
-            self.model.eval()
-            # Target the last bottleneck layer of the last block
-            self.target_layer = self.model.layer4[2].conv3
-        else:
-            self.model = model.to(self.device)
-            self.target_layer = target_layer
 
-        self.n_samples = n_samples
-        self.stdev_spread = stdev_spread
-        self.gradients = None
-        self.activations = None
+    def __init__(
+        self,
+        policy: ISCRLPolicy,
+        feature_extractor: FrozenGoogLeNetPool5 | None = None,
+        samples: int = 10,
+        noise_std: float = 0.15,
+        device: torch.device | str | None = None,
+    ) -> None:
+        if samples < 1:
+            raise ValueError("samples must be at least 1")
+        self.device = torch.device(
+            device or ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        self.policy = policy.to(self.device).eval()
+        for parameter in self.policy.parameters():
+            parameter.requires_grad_(False)
+        self.extractor = (feature_extractor or FrozenGoogLeNetPool5()).to(self.device).eval()
+        self.samples = samples
+        self.noise_std = noise_std
 
-        # Hook registration
-        self.target_layer.register_forward_hook(self.save_activation)
-        self.target_layer.register_backward_hook(self.save_gradient)
+    @staticmethod
+    def _gradcam_pp(activations: Tensor, gradients: Tensor) -> Tensor:
+        gradient_2 = gradients.pow(2)
+        gradient_3 = gradient_2 * gradients
+        activation_sum = activations.sum(dim=(2, 3), keepdim=True)
+        denominator = 2.0 * gradient_2 + activation_sum * gradient_3
+        denominator = torch.where(
+            denominator.abs() > 1e-8,
+            denominator,
+            torch.ones_like(denominator),
+        )
+        alpha = gradient_2 / denominator
+        weights = (alpha * F.relu(gradients)).sum(dim=(2, 3), keepdim=True)
+        return F.relu((weights * activations).sum(dim=1, keepdim=True))
 
-        # Preprocessing for ResNet
-        self.preprocess = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+    def _load_image(self, image_path: str | Path) -> Tuple[np.ndarray, Tensor]:
+        bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise FileNotFoundError(f"could not read image {image_path}")
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        # The official weight transform accepts a NumPy-compatible PIL image.
+        from PIL import Image
 
-    def save_activation(self, module, input, output):
-        self.activations = output
+        tensor = self.extractor.preprocess(Image.fromarray(rgb)).unsqueeze(0).to(self.device)
+        return bgr, tensor
 
-    def save_gradient(self, module, grad_input, grad_output):
-        # grad_output is a tuple, usually (grad,)
-        self.gradients = grad_output[0]
+    def explain(
+        self,
+        image_path: str | Path,
+        context_features: Tensor,
+        frame_index: int,
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Return BGR overlay, normalized heatmap, and raw spatial score."""
+        bgr, clean_input = self._load_image(image_path)
+        context = context_features.to(self.device).detach()
+        if context.dim() == 2:
+            context = context.unsqueeze(0)
+        if context.dim() != 3 or context.size(0) != 1:
+            raise ValueError("context_features must have shape (T,D) or (1,T,D)")
+        if not 0 <= frame_index < context.size(1):
+            raise IndexError("frame_index is outside the sampled sequence")
 
-    def forward(self, img_path):
-        """
-        Generate Grad-CAM++ heatmap for a specific image.
-        """
-        # Load and preprocess image
-        try:
-            img = cv2.imread(img_path)
-            if img is None:
-                raise ValueError(f"Could not open {img_path}")
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        except Exception as e:
-            print(f"Error loading image: {e}")
-            return None, None
+        cam_sum: Tensor | None = None
+        for sample in range(self.samples):
+            if sample == 0 or self.noise_std == 0:
+                image = clean_input.clone()
+            else:
+                scale = clean_input.detach().amax() - clean_input.detach().amin()
+                image = clean_input + torch.randn_like(clean_input) * self.noise_std * scale
+            image.requires_grad_(True)
+            activations, pool5 = self.extractor(image)
+            policy_input = torch.cat(
+                (
+                    context[:, :frame_index],
+                    pool5.unsqueeze(1),
+                    context[:, frame_index + 1 :],
+                ),
+                dim=1,
+            )
+            probability = self.policy(policy_input)[0][0, frame_index, 0]
+            gradients = torch.autograd.grad(probability, activations, retain_graph=False)[0]
+            cam = self._gradcam_pp(activations, gradients).detach()
+            cam_sum = cam if cam_sum is None else cam_sum + cam
 
-        input_tensor = self.preprocess(img_rgb).unsqueeze(0).to(self.device)
-        
-        # SmoothGrad: Add noise and average
-        std_tensor = torch.ones_like(input_tensor) * self.stdev_spread * (input_tensor.max() - input_tensor.min())
-        
-        cam_sum = 0
-        
-        for i in range(self.n_samples):
-            self.model.zero_grad()
-            
-            # Add Gaussian noise
-            noise = torch.normal(mean=0, std=std_tensor).to(self.device)
-            noisy_input = input_tensor + noise
-            if i == 0: noisy_input = input_tensor # First pass clean
+        assert cam_sum is not None
+        raw_cam = cam_sum / float(self.samples)
+        raw_spatial_score = float(raw_cam.mean().cpu())
+        resized = F.interpolate(
+            raw_cam,
+            size=(bgr.shape[0], bgr.shape[1]),
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0]
+        resized = resized - resized.min()
+        resized = resized / resized.max().clamp_min(1e-8)
+        heatmap = resized.cpu().numpy()
+        color = cv2.applyColorMap(np.uint8(255.0 * heatmap), cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(bgr, 0.6, color, 0.4, 0.0)
+        return overlay, heatmap, raw_spatial_score
 
-            output = self.model(noisy_input)
-            
-            # Target class: highest probability class
-            idx = np.argmax(output.cpu().data.numpy())
-            
-            # Backward
-            output[0, idx].backward()
-            
-            # Grad-CAM++ logic
-            gate_f = self.gradients
-            gate_a = self.activations
-            weights = F.adaptive_avg_pool2d(gate_f, 1) # Global Average Pooling
-            
-            # Simple Grad-CAM for stability (changing from ++ to standard for robustness as proxy)
-            # Or implement full ++ formula. Let's stick to standard Grad-CAM for speed/stability if preferred, 
-            # but user asked for Smooth Grad-CAM++.
-            
-            # Let's use the weights * activation
-            cam = torch.mul(self.activations, weights).sum(dim=1, keepdim=True)
-            cam = F.relu(cam)
-            
-            cam_sum += cam
 
-        # Average cams
-        avg_cam = cam_sum / self.n_samples
-        avg_cam = F.interpolate(avg_cam, input_tensor.shape[2:], mode='bilinear', align_corners=False)
-        
-        heatmap = avg_cam.detach().cpu().numpy()[0, 0]
-        heatmap = (heatmap - np.min(heatmap)) / (np.max(heatmap) - np.min(heatmap) + 1e-8) # Normalize 0-1
-        
-        # Overlay
-        heatmap_uint8 = np.uint8(255 * heatmap)
-        heatmap_resized = cv2.resize(heatmap_uint8, (img.shape[1], img.shape[0]))
-        heatmap_colored = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
-        
-        superimposed_img = heatmap_colored * 0.4 + img
-        
-        return superimposed_img, heatmap_resized
+# Compatibility alias used by the previous visualization entry point.
+SmoothGradCAMpp = SmoothedPolicyGradCAMPP
