@@ -9,6 +9,8 @@ import os.path as osp
 import torch
 
 def mkdir_if_missing(directory):
+    if not directory:
+        return
     if not osp.exists(directory):
         try:
             os.makedirs(directory)
@@ -73,9 +75,9 @@ class Logger(object):
             os.fsync(self.file.fileno())
 
     def close(self):
-        self.console.close()
         if self.file is not None:
             self.file.close()
+            self.file = None
 
 def read_json(fpath):
     with open(fpath, 'r') as f:
@@ -86,7 +88,6 @@ def write_json(obj, fpath):
     mkdir_if_missing(osp.dirname(fpath))
     with open(fpath, 'w') as f:
         json.dump(obj, f, indent=4, separators=(',', ': '))
-
 
 
 

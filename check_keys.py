@@ -1,17 +1,28 @@
+"""Inspect the schema and shapes of an ISCRL HDF5 feature file."""
+
+from __future__ import annotations
+
+import argparse
+
 import h5py
 
-dataset_path = 'd:/Python学习/DSR-RL-master/datasets/eccv16_dataset_summe_google_pool5.h5'
-try:
-    with h5py.File(dataset_path, 'r') as f:
-        print("Keys:", list(f.keys())[:3])
-        for key in list(f.keys())[:3]:
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("dataset", help="path to an HDF5 feature file")
+    parser.add_argument("--limit", type=int, default=3)
+    args = parser.parse_args()
+    with h5py.File(args.dataset, "r") as dataset:
+        keys = list(dataset.keys())
+        print(f"Videos: {len(keys)}")
+        for key in keys[: args.limit]:
             print(f"-- {key} --")
-            # Check datasets inside
-            print("  Datasets:", list(f[key].keys()))
-            # Check attributes on the group
-            print("  Group Attrs:", dict(f[key].attrs))
-            # Check if there is a 'video_name' dataset or attribute
-            if 'video_name' in f[key]:
-                print(f"  video_name (dataset): {f[key]['video_name'][()]}")
-except Exception as e:
-    print(f"Error: {e}")
+            group = dataset[key]
+            for name, value in group.items():
+                print(f"  {name}: shape={value.shape}, dtype={value.dtype}")
+            if group.attrs:
+                print(f"  attributes: {dict(group.attrs)}")
+
+
+if __name__ == "__main__":
+    main()

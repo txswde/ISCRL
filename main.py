@@ -1,402 +1,494 @@
-from __future__ import print_function
-import os
-import os.path as osp
+"""Train and evaluate ISCRL as specified in the accompanying manuscript."""
+
+from __future__ import annotations
+
 import argparse
-import sys
-import h5py
-import time
 import datetime
+import os
+from pathlib import Path
+import random
+import sys
+import time
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+
+import h5py
 import numpy as np
 from tabulate import tabulate
-
 import torch
-import torch.nn as nn
-import torch.backends.cudnn as cudnn
-from torch.optim import lr_scheduler
+from torch import Tensor
 from torch.distributions import Bernoulli
 
-from utils import Logger, read_json, write_json, save_checkpoint
-from models import *
+from iscrl_components import AIMController, SimCLRObjective
+from models import ISCRLPolicy
 from rewards import compute_reward
+from scores.eval import evaluate_scores, generate_scores
+from utils import Logger, mkdir_if_missing, read_json, save_checkpoint, write_json
 import vsum_tools
-from iscrl_components import SimCLRLoss, AIMOptimizer
 
-from scores.eval import generate_scores, evaluate_scores
 
-parser = argparse.ArgumentParser("Pytorch code for unsupervised video summarization with REINFORCE")
-# Dataset options
-parser.add_argument('-d', '--dataset', type=str, required=False, help="path to h5 dataset (required)")
-parser.add_argument('-us', '--userscore', type=str, required=True, help="path to h5 of user's scores (required)")
-parser.add_argument('-s', '--split', type=str, required=True, help="path to split file (required)")
-parser.add_argument('--split-id', type=int, default=0, help="split index (default: 0)")
-parser.add_argument('-m', '--metric', type=str, required=True, choices=['tvsum', 'summe'],
-                    help="evaluation metric ['tvsum', 'summe']")
-# Model options
-parser.add_argument('--input-dim', type=int, default=1024, help="input dimension (default: 1024)")
-parser.add_argument('--hidden-dim', type=int, default=512, help="hidden unit dimension of DSN (default: 256)")
-parser.add_argument('--num-layers', type=int, default=2, help="number of RNN layers (default: 1)")
-parser.add_argument('--rnn-cell', type=str, default='gru', help="RNN cell type (default: lstm)")
-# Optimization options
-parser.add_argument('--lr', type=float, default=1e-05, help="learning rate (default: 1e-05)")
-parser.add_argument('--weight-decay', type=float, default=1e-05, help="weight decay rate (default: 1e-05)")
-parser.add_argument('--max-epoch', type=int, default=5, help="maximum epoch for training (default: 60)")
-parser.add_argument('--stepsize', type=int, default=30, help="how many steps to decay learning rate (default: 30)")
-parser.add_argument('--gamma', type=float, default=0.1, help="learning rate decay (default: 0.1)")
-parser.add_argument('--num-episode', type=int, default=5, help="number of episodes (default: 5)")
-parser.add_argument('--beta', type=float, default=0.01, help="weight for summary length penalty term (default: 0.01)")
-# Misc
-parser.add_argument('--seed', type=int, default=1, help="random seed (default: 1)")
-parser.add_argument('--gpu', type=str, default='0', help="which gpu devices to use")
-parser.add_argument('--use-cpu', action='store_true', help="use cpu device")
-parser.add_argument('--evaluate', action='store_true', help="whether to do evaluation only")
-parser.add_argument('--save-dir', type=str, default='log', help="path to save output (default: 'log/')")
-parser.add_argument('--resume', type=str, default='', help="path to resume file")
-parser.add_argument('--verbose', action='store_true', help="whether to show detailed test results")
-parser.add_argument('--save-results', action='store_true', help="whether to save output results")
+DEFAULT_DATASETS = (
+    "datasets/eccv16_dataset_summe_google_pool5.h5",
+    "datasets/eccv16_dataset_tvsum_google_pool5.h5",
+    "datasets/eccv16_dataset_ovp_google_pool5.h5",
+    "datasets/eccv16_dataset_youtube_google_pool5.h5",
+)
 
-args = parser.parse_args()
 
-torch.manual_seed(args.seed)
-os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-use_gpu = torch.cuda.is_available()
-if args.use_cpu: use_gpu = False
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="ISCRL: invariant semantic contrastive reinforcement learning"
+    )
+    data = parser.add_argument_group("data")
+    data.add_argument(
+        "-d",
+        "--dataset",
+        action="append",
+        help=(
+            "HDF5 feature file. Repeat for augmented/transfer experiments. "
+            "When omitted, the four conventional paths under datasets/ are used."
+        ),
+    )
+    data.add_argument("-s", "--split", required=True, help="JSON split file")
+    data.add_argument("--split-id", type=int, default=0)
+    data.add_argument("-us", "--userscore", help="optional HDF5 user-score file")
+    data.add_argument("-m", "--metric", required=True, choices=("tvsum", "summe"))
 
-regularization_factor = 0.15
+    model = parser.add_argument_group("model")
+    model.add_argument("--input-dim", type=int, default=1024)
+    model.add_argument("--hidden-dim", type=int, default=512)
+    model.add_argument("--invariant-dim", type=int, default=128)
+    model.add_argument("--projector-hidden-dim", type=int, default=512)
+    model.add_argument("--attention-dropout", type=float, default=0.5)
 
-def reconstruction_loss(h_origin, h_sum):
-    """L2 loss between original-regenerated features at cLSTM's last hidden layer"""
+    contrastive = parser.add_argument_group("contrastive warm-up")
+    contrastive.add_argument("--warmup-epochs", type=int, default=50)
+    contrastive.add_argument("--temperature", type=float, default=0.5)
+    contrastive.add_argument("--feature-noise", type=float, default=0.03)
+    contrastive.add_argument("--feature-mask", type=float, default=0.20)
+    contrastive.add_argument("--temporal-jitter", type=int, default=1)
+    contrastive.add_argument("--warmup-lr", type=float, default=1e-5)
 
-    return torch.norm(h_origin - h_sum, p=2)
+    rl = parser.add_argument_group("reinforcement learning")
+    rl.add_argument("--rl-epochs", type=int, default=300)
+    rl.add_argument("--lr", type=float, default=1e-5)
+    rl.add_argument("--weight-decay", type=float, default=1e-5)
+    rl.add_argument("--lr-step", type=int, default=30)
+    rl.add_argument("--lr-gamma", type=float, default=0.5)
+    rl.add_argument("--episodes", type=int, default=5)
+    rl.add_argument(
+        "--reward-beta",
+        type=float,
+        default=0.10,
+        help="invariant-space contribution to the dual reward",
+    )
+    rl.add_argument("--temporal-threshold", type=int, default=20)
+    rl.add_argument("--baseline-decay", type=float, default=0.90)
 
-def sparsity_loss(scores):
-    """Summary-Length Regularization"""
+    aim = parser.add_argument_group("adaptive intervention mechanism")
+    aim.add_argument("--intervention-min", type=float, default=0.10)
+    aim.add_argument("--intervention-max", type=float, default=0.50)
+    aim.add_argument("--intervention-penalty", type=float, default=0.10)
+    aim.add_argument("--intervention-increase", type=float, default=1.10)
+    aim.add_argument("--intervention-decrease", type=float, default=0.90)
+    aim.add_argument("--base-clip", type=float, default=5.0)
 
-    return torch.abs(torch.mean(scores) - regularization_factor)
+    misc = parser.add_argument_group("runtime")
+    misc.add_argument("--seed", type=int, default=1)
+    misc.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    misc.add_argument("--evaluate", action="store_true")
+    misc.add_argument("--save-dir", default="log")
+    misc.add_argument("--resume", default="")
+    misc.add_argument("--verbose", action="store_true")
+    misc.add_argument("--save-results", action="store_true")
+    return parser
 
-def main():
-    
-    if not args.evaluate:
-        sys.stdout = Logger(osp.join(args.save_dir, 'log_train.txt'))
-    else:
-        sys.stdout = Logger(osp.join(args.save_dir, 'log_test.txt'))
-    print("==========\nArgs:{}\n==========".format(args))
 
-    if use_gpu:
-        print("Currently using GPU {}".format(args.gpu))
-        cudnn.benchmark = True
-        torch.cuda.manual_seed_all(args.seed)
-    else:
-        print("Currently using CPU")
+class DatasetCollection:
+    """Resolve both canonical keys and ``dataset_name/video_N`` split keys."""
 
-    print("Initialize dataset {}".format(args.dataset))
-    if args.dataset is None:
-        datasets = ['datasets/eccv16_dataset_summe_google_pool5.h5',
-                'datasets/eccv16_dataset_tvsum_google_pool5.h5',
-                'datasets/eccv16_dataset_ovp_google_pool5.h5',
-                'datasets/eccv16_dataset_youtube_google_pool5.h5']
-        
-        dataset = {}
-        for name in datasets:
-            _, base_filename = os.path.split(name)
-            base_filename = os.path.splitext(base_filename)
-            dataset[base_filename[0]] = h5py.File(name, 'r')
-        # Load split file
-        splits = read_json(args.split)
-        assert args.split_id < len(splits), "split_id (got {}) exceeds {}".format(args.split_id, len(splits))
-        split = splits[args.split_id]
-        train_keys = split['train_keys']
-        test_keys = split['test_keys']
-        print("# train videos {}. # test videos {}".format(len(train_keys), len(test_keys)))
-    
-    else:
-        dataset = h5py.File(args.dataset, 'r')
-        num_videos = len(dataset.keys())
-        splits = read_json(args.split)
-        assert args.split_id < len(splits), "split_id (got {}) exceeds {}".format(args.split_id, len(splits))
-        split = splits[args.split_id]
-        train_keys = split['train_keys']
-        test_keys = split['test_keys']
-        print("# total videos {}. # train videos {}. # test videos {}".format(num_videos, len(train_keys), len(test_keys)))
+    def __init__(self, paths: Sequence[str]) -> None:
+        if not paths:
+            raise ValueError("at least one dataset is required")
+        self.files: Dict[str, h5py.File] = {}
+        for path in paths:
+            name = Path(path).stem
+            if name in self.files:
+                raise ValueError(f"duplicate dataset stem: {name}")
+            self.files[name] = h5py.File(path, "r")
 
-    #### Set User Score Dataset ####
-    userscoreset = h5py.File(args.userscore, 'r')
+    def resolve(self, split_key: str) -> h5py.Group:
+        if "/" in split_key:
+            dataset_name, video_key = split_key.split("/", 1)
+            if dataset_name not in self.files:
+                raise KeyError(f"split references unopened dataset {dataset_name!r}")
+            return self.files[dataset_name][video_key]
+        if len(self.files) == 1:
+            return next(iter(self.files.values()))[split_key]
+        matches = [dataset[split_key] for dataset in self.files.values() if split_key in dataset]
+        if len(matches) != 1:
+            raise KeyError(
+                f"unqualified key {split_key!r} resolves to {len(matches)} datasets; "
+                "use dataset_name/video_key in the split"
+            )
+        return matches[0]
 
-    print("Initialize model")
-    model = DSRRL(in_dim=args.input_dim, hid_dim=args.hidden_dim, num_layers=args.num_layers, cell=args.rnn_cell)
+    def close(self) -> None:
+        for dataset in self.files.values():
+            dataset.close()
 
-    optimizer = torch.optim.Adam(model.parameters(), betas=(0.5,0.999) ,lr=args.lr, weight_decay=args.weight_decay)
-    
-    # [ISCRL] Initialize Components
-    simclr_criterion = SimCLRLoss(temperature=0.5).cuda() if use_gpu else SimCLRLoss(temperature=0.5)
-    aim_optimizer = AIMOptimizer(I_min=0.1, I_max=2.0)
-    
-    if args.stepsize > 0:
-        scheduler = lr_scheduler.StepLR(optimizer, step_size=args.stepsize, gamma=args.gamma)
 
-    if args.resume:
-        print("Loading checkpoint from '{}'".format(args.resume))
-        checkpoint = torch.load(args.resume)
-        model.load_state_dict(checkpoint)
-    else:
-        start_epoch = 0
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    if use_gpu:
-        model = nn.DataParallel(model).cuda()
 
-    if args.evaluate:
-        print("Evaluate only")
-        evaluate(model, dataset, test_keys, use_gpu)
-        return
+def load_split(path: str, split_id: int) -> Tuple[List[str], List[str]]:
+    splits = read_json(path)
+    if not 0 <= split_id < len(splits):
+        raise IndexError(f"split-id {split_id} is outside [0, {len(splits) - 1}]")
+    split = splits[split_id]
+    return split["train_keys"], split["test_keys"]
 
-    if args.dataset is None:
-        print("==> Start training")
-        start_time = time.time()
+
+def feature_tensor(group: h5py.Group, device: torch.device) -> Tensor:
+    features = np.asarray(group["features"], dtype=np.float32)
+    return torch.from_numpy(features).unsqueeze(0).to(device)
+
+
+def contrastive_warmup(
+    model: ISCRLPolicy,
+    datasets: DatasetCollection,
+    train_keys: Sequence[str],
+    args: argparse.Namespace,
+    device: torch.device,
+) -> List[float]:
+    """Optimize only the 1024-512-128 projection head for 50 epochs."""
+    if args.warmup_epochs <= 0:
+        return []
+    model.set_projector_trainable(True)
+    objective = SimCLRObjective(
+        model.simclr_projector,
+        temperature=args.temperature,
+        noise_std=args.feature_noise,
+        mask_prob=args.feature_mask,
+        temporal_jitter=args.temporal_jitter,
+    ).to(device)
+    optimizer = torch.optim.Adam(
+        model.simclr_projector.parameters(),
+        lr=args.warmup_lr,
+        weight_decay=args.weight_decay,
+    )
+    history: List[float] = []
+    print(f"==> Contrastive warm-up ({args.warmup_epochs} epochs)")
+    for epoch in range(args.warmup_epochs):
+        losses: List[float] = []
+        order = np.random.permutation(len(train_keys))
+        for index in order:
+            original = feature_tensor(datasets.resolve(train_keys[index]), device)
+            if original.size(1) < 2:
+                continue
+            optimizer.zero_grad(set_to_none=True)
+            loss = objective(original)
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.detach().cpu()))
+        mean_loss = float(np.mean(losses)) if losses else float("nan")
+        history.append(mean_loss)
+        print(
+            f"Warm-up {epoch + 1:03d}/{args.warmup_epochs:03d} "
+            f"InfoNCE {mean_loss:.6f}"
+        )
+    model.set_projector_trainable(False)
+    return history
+
+
+def scheduled_learning_rate(args: argparse.Namespace, epoch: int) -> float:
+    if args.lr_step <= 0:
+        return args.lr
+    return args.lr * args.lr_gamma ** (epoch // args.lr_step)
+
+
+def train_policy(
+    model: ISCRLPolicy,
+    datasets: DatasetCollection,
+    train_keys: Sequence[str],
+    args: argparse.Namespace,
+    device: torch.device,
+    aim: AIMController,
+    start_epoch: int = 0,
+    optimizer_state: Mapping[str, object] | None = None,
+) -> Tuple[Mapping[str, List[float]], torch.optim.Optimizer]:
+    """Run Algorithm 1 with clipping and LR scaling applied before each update."""
+    model.set_projector_trainable(False)
+    policy_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.Adam(
+        policy_parameters,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=(0.5, 0.999),
+    )
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+    reward_history: Dict[str, List[float]] = {key: [] for key in train_keys}
+    print(f"==> RL policy optimization ({args.rl_epochs} epochs)")
+
+    for epoch in range(start_epoch, args.rl_epochs):
         model.train()
-        baselines = {key: 0. for key in train_keys} # baseline rewards for videos
-        reward_writers = {key: [] for key in train_keys} # record reward changes for each video
+        epoch_rewards: List[float] = []
+        epoch_losses: List[float] = []
+        epoch_grad_norms: List[float] = []
+        order = np.random.permutation(len(train_keys))
+        base_lr = scheduled_learning_rate(args, epoch)
 
-        for epoch in range(start_epoch, args.max_epoch):
-            idxs = np.arange(len(train_keys))
-            np.random.shuffle(idxs) # shuffle indices
+        for index in order:
+            video_id = train_keys[index]
+            original = feature_tensor(datasets.resolve(video_id), device)
+            probabilities, _, _, invariant, _ = model(original)
+            distribution = Bernoulli(probabilities.clamp(1e-6, 1.0 - 1e-6))
+            baseline = aim.state_for(video_id).baseline
+            losses: List[Tensor] = []
+            rewards: List[float] = []
 
-            for idx in idxs:
-                key_parts = train_keys[idx].split('/')
-                name, key = key_parts
-                seq = dataset[name][key]['features'][...] # sequence of features, (seq_len, dim)
-                seq = torch.from_numpy(seq).unsqueeze(0) # input shape (1, seq_len, dim)
-                if use_gpu: seq = seq.cuda()
-                
-                # [ISCRL] Forward pass returns invariant features too
-                probs, out_feats, att_score, features_inv, _ = model(seq) # output shape (1, seq_len, 1)
+            for _ in range(args.episodes):
+                actions = distribution.sample()
+                reward = compute_reward(
+                    original,
+                    invariant,
+                    actions,
+                    beta=args.reward_beta,
+                    temporal_distance_threshold=args.temporal_threshold,
+                )
+                reward_value = float(reward.detach().cpu())
+                advantage = reward_value - baseline
+                # Eq. (9) sums log-policy gradients over all sampled frames.
+                losses.append(-distribution.log_prob(actions).sum() * advantage)
+                rewards.append(reward_value)
 
-                cost = args.beta * (probs.mean() - 0.5)**2 # minimize summary length penalty term
-                m = Bernoulli(probs)
-                epis_rewards = []
-                for _ in range(args.num_episode):
-                    actions = m.sample()
-                    log_probs = m.log_prob(actions)
-                    
-                    # [ISCRL] Dual-Space Reward
-                    reward = compute_reward(seq, features_inv, actions, beta=0.1, use_gpu=use_gpu)
-                    
-                    expected_reward = log_probs.mean() * (reward - baselines[train_keys[idx]])
-                    cost -= expected_reward
-                    epis_rewards.append(reward.item())
-                
-                recon_loss = reconstruction_loss(seq, out_feats)
-                spar_loss = sparsity_loss(att_score)
-                
-                # [ISCRL] SimCLR Loss
-                # features_inv is (1, SeqLen, 128), squeeze to (SeqLen, 128)
-                simclr_loss_val = simclr_criterion(features_inv.squeeze(0))
+            average_reward = float(np.mean(rewards))
+            policy_loss = torch.stack(losses).mean()
+            clip_threshold, lr_scale, _ = aim.update(video_id, average_reward)
+            for group in optimizer.param_groups:
+                group["lr"] = base_lr * lr_scale
 
-                total_loss = cost + recon_loss + spar_loss + simclr_loss_val
+            optimizer.zero_grad(set_to_none=True)
+            policy_loss.backward()
+            # AIM regulates the gradients used by this optimizer update.
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy_parameters, clip_threshold)
+            optimizer.step()
+            aim.update_baseline(video_id, average_reward)
 
-                optimizer.zero_grad()
-                total_loss.backward()
-                optimizer.step()
-                
-                # [ISCRL] AIM Step - Update Intervention Intensity
-                # Average reward for this batch
-                avg_reward = np.mean(epis_rewards)
-                clip_norm, lr_scale = aim_optimizer.update(avg_reward)
-                
-                # Apply Dynamic Clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-                
-                # [ISCRL] Note: PyTorch optimizers don't easily support per-step LR scaling without scheduler hack.
-                # Here we can just manually adjust param groups temporarily or assume scheduler handles epoch-level.
-                # The instructions say "lr_scale = ...". Let's apply it to optimizer for next step or current?
-                # Usually applied before step(), but here we applied step(). 
-                # Let's adjust for next iteration.
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = args.lr * lr_scale
+            reward_history[video_id].append(average_reward)
+            epoch_rewards.append(average_reward)
+            epoch_losses.append(float(policy_loss.detach().cpu()))
+            epoch_grad_norms.append(float(grad_norm.detach().cpu()))
 
-                baselines[train_keys[idx]] = 0.9 * baselines[train_keys[idx]] + 0.1 * np.mean(epis_rewards) # update baseline reward via moving average
-                reward_writers[train_keys[idx]].append(np.mean(epis_rewards))
+        states = [aim.state_for(key) for key in train_keys]
+        print(
+            f"RL {epoch + 1:03d}/{args.rl_epochs:03d} "
+            f"reward {np.mean(epoch_rewards):.6f} "
+            f"loss {np.mean(epoch_losses):.6f} "
+            f"grad {np.mean(epoch_grad_norms):.6f} "
+            f"I {np.mean([state.intervention for state in states]):.4f} "
+            f"base_lr {base_lr:.2e}"
+        )
+    return reward_history, optimizer
 
-            epoch_reward = np.mean([reward_writers[key][epoch] for key in train_keys])
-            #print("epoch {}/{}\t reward {}\t loss {}".format(epoch+1, args.max_epoch, epoch_reward, total_loss)) 
+
+def _user_scores(userscores: h5py.File, split_key: str) -> np.ndarray:
+    video_key = split_key.rsplit("/", 1)[-1]
+    if split_key in userscores:
+        group = userscores[split_key]
+    elif video_key in userscores:
+        group = userscores[video_key]
     else:
-        print("==> Start training")
-        start_time = time.time()
-        model.train()
-        baselines = {key: 0. for key in train_keys} # baseline rewards for videos
-        reward_writers = {key: [] for key in train_keys} # record reward changes for each video
+        raise KeyError(f"no user scores found for {split_key!r}")
+    return np.asarray(group["user_scores"])
 
-        for epoch in range(start_epoch, args.max_epoch):
-            idxs = np.arange(len(train_keys))
-            np.random.shuffle(idxs) # shuffle indices
 
-            for idx in idxs:
-                key = train_keys[idx]
-                seq = dataset[key]['features'][...] # sequence of features, (seq_len, dim)
-                seq = torch.from_numpy(seq).unsqueeze(0) # input shape (1, seq_len, dim)
-                if use_gpu: seq = seq.cuda()
-                
-                # [ISCRL] Forward pass returns invariant features too
-                probs, out_feats, att_score, features_inv, _ = model(seq) # output shape (1, seq_len, 1)
+def evaluate(
+    model: ISCRLPolicy,
+    datasets: DatasetCollection,
+    userscores: h5py.File | None,
+    test_keys: Sequence[str],
+    args: argparse.Namespace,
+    device: torch.device,
+) -> float:
+    print("==> Evaluation")
+    model.eval()
+    eval_metric = "avg" if args.metric == "tvsum" else "max"
+    f_scores: List[float] = []
+    spearman: List[float] = []
+    kendall: List[float] = []
+    table = [["No.", "Video", "F-score"]]
+    result_file = None
+    if args.save_results:
+        result_path = Path(args.save_dir) / (
+            f"result_rl{args.rl_epochs}_split{args.split_id}.h5"
+        )
+        result_file = h5py.File(result_path, "w")
 
-                cost = args.beta * (probs.mean() - 0.5)**2 # minimize summary length penalty term
-                m = Bernoulli(probs)
-                epis_rewards = []
-                for _ in range(args.num_episode):
-                    actions = m.sample()
-                    log_probs = m.log_prob(actions)
-                    
-                    # [ISCRL] Dual-Space Reward
-                    reward = compute_reward(seq, features_inv, actions, beta=0.1, use_gpu=use_gpu)
-                    
-                    expected_reward = log_probs.mean() * (reward - baselines[key])
-                    cost -= expected_reward
-                    epis_rewards.append(reward.item())
-
-                recon_loss = reconstruction_loss(seq, out_feats)
-                spar_loss = sparsity_loss(att_score)
-
-                # [ISCRL] SimCLR Loss
-                simclr_loss_val = simclr_criterion(features_inv.squeeze(0))
-
-                total_loss = cost + recon_loss + spar_loss + simclr_loss_val
-
-                #print(cost.item(), recon_loss.item(), spar_loss.item())
-
-                optimizer.zero_grad()
-                total_loss.backward()
-                optimizer.step()
-                
-                # [ISCRL] AIM Step
-                avg_reward = np.mean(epis_rewards)
-                clip_norm, lr_scale = aim_optimizer.update(avg_reward)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = args.lr * lr_scale
-
-                baselines[key] = 0.9 * baselines[key] + 0.1 * np.mean(epis_rewards) # update baseline reward via moving average
-                reward_writers[key].append(np.mean(epis_rewards))
-
-            epoch_reward = np.mean([reward_writers[key][epoch] for key in train_keys])
-            print("Epoch {}/{}\t Reward {:.4f}\t Loss {:.4f}\t SimCLR {:.4f}\t I_t {:.2f}\t G_t {:.4f}\t LR_scale {:.2f}".format(
-                epoch+1, args.max_epoch, epoch_reward, total_loss.item(), simclr_loss_val.item(), 
-                aim_optimizer.I_t, getattr(aim_optimizer, 'last_Gt', 0.0), lr_scale))
-        
-    write_json(reward_writers, osp.join(args.save_dir, 'rewards.json'))
-    evaluate(model, dataset, userscoreset, test_keys, use_gpu)
-    
-    elapsed = round(time.time() - start_time)
-    elapsed = str(datetime.timedelta(seconds=elapsed))
-    print("Finished. Total elapsed time (h:m:s): {}".format(elapsed))
-
-    model_state_dict = model.module.state_dict() if use_gpu else model.state_dict()
-    model_save_path = osp.join(args.save_dir, args.metric+'_model_epoch_' + str(args.max_epoch) +'_split_id_' + str(args.split_id) + '-' + str(args.rnn_cell) + '.pth.tar')
-    save_checkpoint(model_state_dict, model_save_path)
-    print("Model saved to {}".format(model_save_path))
-
-def evaluate(model, dataset, userscoreset, test_keys, use_gpu):
-    print("==> Test")
     with torch.no_grad():
-        model.eval()
-        fms = []
-        eval_metric = 'avg' if args.metric == 'tvsum' else 'max'
-        if args.verbose: table = [["No.", "Video", "F-score"]]
+        for number, split_key in enumerate(test_keys, start=1):
+            group = datasets.resolve(split_key)
+            original = feature_tensor(group, device)
+            probabilities, _, _, _, _ = model(original)
+            scores = probabilities.squeeze(0).squeeze(-1).cpu().numpy()
+            change_points = np.asarray(group["change_points"])
+            n_frames = int(group["n_frames"][()])
+            n_frame_per_seg = np.asarray(group["n_frame_per_seg"]).tolist()
+            picks = np.asarray(group["picks"])
+            user_summary = np.asarray(group["user_summary"])
+            gt_score = np.asarray(group["gtscore"])
+            machine_summary, gt_frame_score = vsum_tools.generate_summary(
+                scores,
+                gt_score,
+                change_points,
+                n_frames,
+                n_frame_per_seg,
+                picks,
+            )
+            f_score, _, _ = vsum_tools.evaluate_summary(
+                machine_summary, user_summary, eval_metric
+            )
+            f_scores.append(float(f_score))
+            if userscores is not None:
+                annotations = _user_scores(userscores, split_key)
+                machine_scores = generate_scores(scores, n_frames, picks)
+                spearman.append(evaluate_scores(machine_scores, annotations, "spearmanr"))
+                kendall.append(evaluate_scores(machine_scores, annotations, "kendalltau"))
+            if args.verbose:
+                table.append([number, split_key, f"{f_score:.1%}"])
+            if result_file is not None:
+                output = result_file.require_group(split_key)
+                output.create_dataset("gt_frame_score", data=gt_frame_score)
+                output.create_dataset("score", data=scores)
+                output.create_dataset("machine_summary", data=machine_summary)
+                output.create_dataset("gtscore", data=gt_score)
+                output.create_dataset("fm", data=f_score)
 
-        if args.save_results:
-            h5_res = h5py.File(osp.join(args.save_dir, 'result_ep{}_split_{}_{}.h5'.format(args.max_epoch, args.split_id, args.rnn_cell)), 'w')
-        
-        spear_avg_corrs = []
-        kendal_avg_corrs = []
-
-        if args.dataset is None:
-            for key_idx, _ in enumerate(test_keys):
-                key_parts = test_keys[key_idx].split('/')
-                name, key = key_parts
-                seq = dataset[name][key]['features'][...]
-                seq = torch.from_numpy(seq).unsqueeze(0)
-                if use_gpu: seq = seq.cuda()
-                probs, _, _, _, _ = model(seq)
-                probs = probs.data.cpu().squeeze().numpy()
-                cps = dataset[name][key]['change_points'][...]
-                num_frames = dataset[name][key]['n_frames'][()]
-                nfps = dataset[name][key]['n_frame_per_seg'][...].tolist()
-                positions = dataset[name][key]['picks'][...]
-                user_summary = dataset[name][key]['user_summary'][...]
-
-                gtscore = dataset[name][key]['gtscore'][...]
-
-                machine_summary, gt_frame_score = vsum_tools.generate_summary(probs, gtscore, cps, num_frames, nfps, positions)
-                fm, _, _ = vsum_tools.evaluate_summary(machine_summary, user_summary, eval_metric)
-                fms.append(fm)
-
-                #### Calculate correlation matrices ####
-                user_scores = userscoreset[key]["user_scores"][...]
-                machine_scores = generate_scores(probs, num_frames, positions)
-                spear_avg_corr = evaluate_scores(machine_scores, user_scores, metric="spearmanr")
-                kendal_avg_corr = evaluate_scores(machine_scores, user_scores, metric="kendalltau")
-
-                spear_avg_corrs.append(spear_avg_corr)
-                kendal_avg_corrs.append(kendal_avg_corr)
-
-                if args.verbose:
-                    table.append([key_idx+1, key, "{:.1%}".format(fm)])
-
-                if args.save_results:
-                    h5_res.create_dataset(key + '/gt_frame_score', data=gt_frame_score)
-                    h5_res.create_dataset(key + '/score', data=probs)
-                    h5_res.create_dataset(key + '/machine_summary', data=machine_summary)
-                    h5_res.create_dataset(key + '/gtscore', data=dataset[name][key]['gtscore'][...])
-                    h5_res.create_dataset(key + '/fm', data=fm)
-        else:
-            for key_idx, key in enumerate(test_keys):
-                seq = dataset[key]['features'][...]
-                seq = torch.from_numpy(seq).unsqueeze(0)
-                if use_gpu: seq = seq.cuda()
-                probs, _, _, _, _ = model(seq)
-                probs = probs.data.cpu().squeeze().numpy()
-                cps = dataset[key]['change_points'][...]
-                num_frames = dataset[key]['n_frames'][()]
-                nfps = dataset[key]['n_frame_per_seg'][...].tolist()
-                positions = dataset[key]['picks'][...]
-                user_summary = dataset[key]['user_summary'][...]
-
-                gtscore = dataset[key]['gtscore'][...]
-
-                machine_summary, gt_frame_score = vsum_tools.generate_summary(probs, gtscore, cps, num_frames, nfps, positions)
-                fm, _, _ = vsum_tools.evaluate_summary(machine_summary, user_summary, eval_metric)
-                fms.append(fm)
-
-                #### Calculate correlation matrices ####
-                user_scores = userscoreset[key]["user_scores"][...]
-                machine_scores = generate_scores(probs, num_frames, positions)
-                spear_avg_corr = evaluate_scores(machine_scores, user_scores, metric="spearmanr")
-                kendal_avg_corr = evaluate_scores(machine_scores, user_scores, metric="kendalltau")
-
-                spear_avg_corrs.append(spear_avg_corr)
-                kendal_avg_corrs.append(kendal_avg_corr)
-
-                if args.verbose:
-                    table.append([key_idx+1, key, "{:.1%}".format(fm)])
-
-                if args.save_results:
-                    h5_res.create_dataset(key + '/gt_frame_score', data=gt_frame_score)
-                    h5_res.create_dataset(key + '/score', data=probs)
-                    h5_res.create_dataset(key + '/machine_summary', data=machine_summary)
-                    h5_res.create_dataset(key + '/gtscore', data=dataset[key]['gtscore'][...])
-                    h5_res.create_dataset(key + '/fm', data=fm)
-
+    if result_file is not None:
+        result_file.close()
     if args.verbose:
         print(tabulate(table))
+    mean_f_score = float(np.mean(f_scores))
+    print(f"Average F1-score {mean_f_score:.1%}")
+    if spearman:
+        print(f"Average Kendall tau {np.nanmean(kendall):.6f}")
+        print(f"Average Spearman rho {np.nanmean(spearman):.6f}")
+    return mean_f_score
 
-    if args.save_results: h5_res.close()
 
-    mean_fm = np.mean(fms)
-    print("Average F1-score {:.1%}".format(mean_fm))
+def checkpoint_state(
+    model: ISCRLPolicy,
+    optimizer: torch.optim.Optimizer | None,
+    aim: AIMController,
+    args: argparse.Namespace,
+    warmup_history: Sequence[float],
+) -> Dict[str, object]:
+    return {
+        "state_dict": model.state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "aim": aim.state_dict(),
+        "warmup_history": list(warmup_history),
+        "rl_epoch": args.rl_epochs,
+        "args": vars(args),
+    }
 
-    mean_spear_avg = np.mean(spear_avg_corrs)
-    mean_kendal_avg = np.mean(kendal_avg_corrs)
-    print("Average Kendal {}".format(mean_kendal_avg))
-    print("Average Spear {}".format(mean_spear_avg))
 
-    return mean_fm
+def run(args: argparse.Namespace) -> None:
+    if args.episodes < 1:
+        raise ValueError("--episodes must be at least 1")
+    seed_everything(args.seed)
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+    mkdir_if_missing(args.save_dir)
+    log_name = "log_test.txt" if args.evaluate else "log_train.txt"
+    logger = Logger(os.path.join(args.save_dir, log_name))
+    original_stdout = sys.stdout
+    sys.stdout = logger
 
-if __name__ == '__main__':
+    dataset_paths = args.dataset or list(DEFAULT_DATASETS)
+    datasets = DatasetCollection(dataset_paths)
+    userscores = h5py.File(args.userscore, "r") if args.userscore else None
+    try:
+        train_keys, test_keys = load_split(args.split, args.split_id)
+        print(args)
+        print(f"Device: {device}; train videos: {len(train_keys)}; test videos: {len(test_keys)}")
+        model = ISCRLPolicy(
+            input_dim=args.input_dim,
+            state_dim=args.hidden_dim,
+            invariant_dim=args.invariant_dim,
+            projector_hidden_dim=args.projector_hidden_dim,
+            attention_dropout=args.attention_dropout,
+        ).to(device)
+        aim = AIMController(
+            intervention_min=args.intervention_min,
+            intervention_max=args.intervention_max,
+            penalty=args.intervention_penalty,
+            increase_factor=args.intervention_increase,
+            decrease_factor=args.intervention_decrease,
+            base_clip=args.base_clip,
+            baseline_decay=args.baseline_decay,
+        )
+        start_epoch = 0
+        optimizer_state = None
+        warmup_history: List[float] = []
+        if args.resume:
+            checkpoint = torch.load(args.resume, map_location=device)
+            state_dict = checkpoint.get("state_dict", checkpoint)
+            state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
+            model.load_state_dict(state_dict)
+            if isinstance(checkpoint, dict):
+                aim.load_state_dict(checkpoint.get("aim"))
+                start_epoch = int(checkpoint.get("rl_epoch", 0))
+                warmup_history = list(checkpoint.get("warmup_history", []))
+                optimizer_state = checkpoint.get("optimizer")
+            print(f"Loaded checkpoint {args.resume!r} at RL epoch {start_epoch}")
+
+        if args.evaluate:
+            evaluate(model, datasets, userscores, test_keys, args, device)
+            return
+
+        started = time.time()
+        if not args.resume:
+            warmup_history = contrastive_warmup(model, datasets, train_keys, args, device)
+        rewards, optimizer = train_policy(
+            model,
+            datasets,
+            train_keys,
+            args,
+            device,
+            aim,
+            start_epoch=start_epoch,
+            optimizer_state=optimizer_state,
+        )
+        write_json(rewards, os.path.join(args.save_dir, "rewards.json"))
+        checkpoint_path = Path(args.save_dir) / (
+            f"{args.metric}_iscrl_rl{args.rl_epochs}_split{args.split_id}.pth.tar"
+        )
+        save_checkpoint(
+            checkpoint_state(model, optimizer, aim, args, warmup_history),
+            str(checkpoint_path),
+        )
+        print(f"Model saved to {checkpoint_path}")
+        evaluate(model, datasets, userscores, test_keys, args, device)
+        elapsed = datetime.timedelta(seconds=round(time.time() - started))
+        print(f"Finished in {elapsed}")
+    finally:
+        datasets.close()
+        if userscores is not None:
+            userscores.close()
+        sys.stdout = original_stdout
+        logger.close()
+
+
+def main() -> None:
+    run(build_parser().parse_args())
+
+
+if __name__ == "__main__":
     main()
